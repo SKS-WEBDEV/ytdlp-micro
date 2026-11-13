@@ -249,7 +249,10 @@ async def proxy_m3u8(url: str, key: str = None, request: Request = None):
         stripped = line.strip()
         if stripped and not stripped.startswith('#') and 'googlevideo.com' in stripped:
             # Rewrite manifest URL to go through proxy
-            new_lines.append(f"{f'{request.url_for(\"proxy_m3u8\")}?url={base64.urlsafe_b64encode(stripped.encode()).decode()}&key={API_KEY}'}")
+            proxy_url = request.url_for("proxy_m3u8")
+            encoded_url = base64.urlsafe_b64encode(stripped.encode()).decode()
+            
+            new_lines.append(f"{proxy_url}?url={encoded_url}&key={API_KEY}")
         else:
             new_lines.append(line)
 
