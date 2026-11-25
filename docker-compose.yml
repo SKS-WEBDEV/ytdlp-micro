@@ -1,0 +1,17 @@
+services:
+  ytdlp:
+    build: .
+    container_name: ytdlp-micro
+    # 127.0.0.1 on the left is the guard: the port is not reachable from
+    # your LAN or the internet, only from this machine.
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      API_KEY: ${API_KEY:-local-dev-key}
+      DOWNLOAD_DIR: /data
+      MAX_DURATION: "7200"
+      TOKEN_TTL: "21600"
+      # No CORS / PUBLIC_BASE_URL needed: nothing external calls this.
+    volumes:
+      - ./downloads:/data
+    restart: unless-stopped
