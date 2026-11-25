@@ -14,10 +14,12 @@ Env vars
 """
 
 import base64
+import glob
 import hashlib
 import hmac
 import os
 import re
+import shutil
 import time
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -26,7 +28,7 @@ import httpx
 import yt_dlp
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 
 app = FastAPI(title="yt-dlp Microservice", version="1.1.0")
 
@@ -38,8 +40,13 @@ COOKIES_CONTENT = os.getenv("COOKIES_CONTENT", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 TOKEN_TTL = int(os.getenv("TOKEN_TTL", "21600"))
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
+# --- Personal download mode -------------------------------------------------
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/data")
+MAX_DURATION = int(os.getenv("MAX_DURATION", "7200"))  # seconds; 2h default
+ALLOWED_AUDIO_FORMATS = {"m4a", "mp3", "flac", "wav"}
 
 COOKIES_FILE = "/tmp/cookies.txt"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 ALLOWED_HOST_SUFFIXES = ("googlevideo.com", "youtube.com")
 
@@ -183,6 +190,42 @@ def build_ytdlp_options() -> dict:
         opts["cookiefile"] = COOKIES_FILE
     return opts
 
+def build_download_options(fmt: str) -> dict:
+    """yt-dlp options for a single audio file. Requires ffmpeg in the image."""
+    postprocessors = [{"key": "FFmpegMetadata"}]
+
+    extract = {"key": "FFmpegExtractAudio", "preferredcodec": fmt}
+    if fmt == "mp3":
+        # Only mp3 takes a quality target; m4a is remuxed, not re-encoded.
+        extract["preferredquality"] = "192"
+    postprocessors.insert(0, extract)
+
+    # Cover art is meaningless in a .wav container.
+    if fmt in {"m4a", "mp3", "flac"}:
+        postprocessors.append({"key": "EmbedThumbnail"})
+
+    opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title).150B [%(id)s].%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "prefer_ffmpeg": True,
+        "writethumbnail": fmt in {"m4a", "mp3", "flac"},
+        "postprocessors": postprocessors,
+        # Refuse anything longer than MAX_DURATION instead of burning CPU on it.
+        "match_filter": lambda info, *args, **kwargs: (
+            None
+            if (info.get("duration") or 0) <= MAX_DURATION
+            else f"longer than {MAX_DURATION}s"
+        ),
+    }
+
+    if COOKIES_CONTENT and os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+
+    return opts
+
 
 def _has(codec) -> bool:
     return bool(codec) and codec != "none"
@@ -225,8 +268,7 @@ def root():
 @app.get("/health")
 def health():
     """Health check endpoint for uptime monitoring."""
-    return {"status": "ok"}
-
+    return {"status": "ok", "ffmpeg": shutil.which("ffmpeg") is not None}
 
 # Plain `def` (not async): yt-dlp is blocking, so FastAPI runs this in a
 # threadpool instead of freezing the event loop.
@@ -365,6 +407,74 @@ def get_streams(request: Request, url: str, x_api_key: Optional[str] = Header(No
 
     return result
 
+@app.get("/download")
+def download_audio(
+    url: str,
+    fmt: str = "m4a",
+    x_api_key: Optional[str] = Header(None),
+):
+    """
+    Download a single audio track. Requires x-api-key.
+
+    fmt: m4a (native, no re-encode) | mp3 | flac | wav
+    The file is written to DOWNLOAD_DIR and served with Range support.
+    """
+    require_api_key(x_api_key)
+
+    fmt = (fmt or "").lower()
+    if fmt not in ALLOWED_AUDIO_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format. Use one of: {', '.join(sorted(ALLOWED_AUDIO_FORMATS))}",
+        )
+
+    video_id = extract_video_id(url)
+    if not video_id:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(status_code=501, detail="ffmpeg is not installed in this image")
+
+    try:
+        with yt_dlp.YoutubeDL(build_download_options(fmt)) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}", download=True
+            )
+            final = info.get("filepath") or ydl.prepare_filename(info)
+    except yt_dlp.utils.DownloadError as e:
+        raise HTTPException(status_code=502, detail=f"yt-dlp error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+    # prepare_filename() reports the pre-postprocessor extension.
+    if not os.path.isfile(final):
+        base, _ = os.path.splitext(final)
+        if os.path.isfile(f"{base}.{fmt}"):
+            final = f"{base}.{fmt}"
+
+    if not os.path.isfile(final):
+        # Last resort: find whatever yt-dlp actually wrote for this video id.
+        found = [
+            p
+            for p in glob.glob(os.path.join(DOWNLOAD_DIR, f"*[{video_id}].*"))
+            if not p.endswith((".webp", ".jpg", ".jpeg", ".png", ".part"))
+        ]
+        if not found:
+            raise HTTPException(status_code=500, detail="Downloaded file not found")
+        final = max(found, key=os.path.getmtime)
+
+    media_types = {
+        "m4a": "audio/mp4",
+        "mp3": "audio/mpeg",
+        "flac": "audio/flac",
+        "wav": "audio/wav",
+    }
+
+    return FileResponse(
+        final,
+        media_type=media_types[fmt],
+        filename=os.path.basename(final),
+    )
 
 @app.get("/proxy-m3u8")
 async def proxy_m3u8(request: Request, url: str, token: Optional[str] = None):
